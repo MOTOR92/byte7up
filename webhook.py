@@ -36,8 +36,20 @@ SUPPORTED_USER_EVENTS = set(EVENTS_TO_BACKUP) | set(EVENTS_TO_RESTORE) | {
 PORT = int(os.getenv("PORT", "3000"))
 API_URL = os.getenv("RW_API_URL", "https://panel.example.com/api").rstrip("/")
 API_TOKEN = os.getenv("RW_API_TOKEN", "YOUR_API_TOKEN")
-BACKUP_SQUAD_UUIDS = [     s.strip()     for s in os.getenv("BACKUP_SQUAD_UUID", "backup-squad-uuid").split(",")     if s.strip() ]
-EXTERNAL_SQUAD_UUIDS = [     s.strip()     for s in os.getenv("EXTERNAL_SQUAD_UUID", "").split(",")     if s.strip() ]
+BACKUP_SQUAD_UUIDS = [
+    s.strip()
+    for s in os.getenv("BACKUP_SQUAD_UUID", "backup-squad-uuid").split(",")
+    if s.strip()
+]
+EXTERNAL_SQUAD_UUIDS = [
+    s.strip()
+    for s in (
+        os.getenv("EXTERNAL_SQUAD_UUIDS")
+        or os.getenv("EXTERNAL_SQUAD_UUID")
+        or ""
+    ).split(",")
+    if s.strip()
+]
 TEMP_ACTIVE_DAYS = getenv_int("TEMP_ACTIVE_DAYS", 3)
 TEMP_ACTIVE_TRAFFIC_LIMIT_MB = max(0, getenv_int("TEMP_ACTIVE_TRAFFIC_LIMIT_MB", 300))
 TEMP_ACTIVE_TRAFFIC_LIMIT_BYTES = (
@@ -258,6 +270,34 @@ def extract_squad_uuids(user):
     return []
 
 
+def extract_external_squad_uuid(user):
+    candidate_keys = (
+        "externalSquadUuid",
+        "external_squad_uuid",
+        "externalSquad",
+        "external_squad",
+    )
+
+    for key in candidate_keys:
+        value = user.get(key)
+        if isinstance(value, str) and value:
+            return value
+        if isinstance(value, dict):
+            uuid_value = value.get("uuid")
+            if isinstance(uuid_value, str) and uuid_value:
+                return uuid_value
+
+    return None
+
+
+def external_squads_match(current_external_squad_uuid, target_external_squad_uuid):
+    return (current_external_squad_uuid or None) == (target_external_squad_uuid or None)
+
+
+def get_backup_external_squad_uuid():
+    return EXTERNAL_SQUAD_UUIDS[0] if EXTERNAL_SQUAD_UUIDS else None
+
+
 def extract_expire_at(user):
     candidate_keys = (
         "expireAt",
@@ -368,10 +408,19 @@ def squads_match(current_squads, target_squads):
     return normalize_squad_uuids(current_squads) == normalize_squad_uuids(target_squads)
 
 
-def build_user_state(original_squads, status="", expire_at=None):
+def build_user_state(
+    original_squads,
+    status="",
+    expire_at=None,
+    original_external_squad_uuid=None,
+    original_external_squad_known=False,
+):
     user_state = {
         "original_squads": normalize_squad_uuids(original_squads),
     }
+
+    if original_external_squad_known:
+        user_state["original_external_squad_uuid"] = original_external_squad_uuid
 
     if status:
         user_state["original_status"] = status
@@ -429,6 +478,12 @@ def normalize_user_state(user_uuid, raw_state):
     if isinstance(temporary_subscription_profile, dict):
         user_state["temporary_subscription_profile"] = normalize_json_value(
             temporary_subscription_profile
+        )
+
+    if "original_external_squad_uuid" in raw_state:
+        external_value = raw_state.get("original_external_squad_uuid")
+        user_state["original_external_squad_uuid"] = (
+            external_value if isinstance(external_value, str) and external_value else None
         )
 
     return user_state
@@ -572,28 +627,38 @@ def patch_user(user_uuid, payload_variants, response_validator=None):
     return False
 
 
-def is_external_squad(squad_uuid):
-    return squad_uuid in EXTERNAL_SQUAD_UUIDS
-
-
 def patch_user_squad(user_uuid, squads):
-    if not squads:
-        return True
-
-    first_squad = squads[0] if isinstance(squads, list) else squads
-
-    if is_external_squad(first_squad):
-        payload_variants = (
-            {"externalSquadUuid": first_squad},
-            {"external_squad_uuid": first_squad},
-        )
-    else:
-        payload_variants = (
-            {"activeInternalSquads": squads},
-            {"active_internal_squads": squads},
-        )
-
+    payload_variants = (
+        {"activeInternalSquads": squads},
+        {"active_internal_squads": squads},
+    )
     return patch_user(user_uuid, payload_variants)
+
+
+def patch_user_external_squad(user_uuid, external_squad_uuid, hwid_device_limit=None):
+    primary_payload = {"externalSquadUuid": external_squad_uuid}
+    fallback_payload = {"external_squad_uuid": external_squad_uuid}
+
+    if hwid_device_limit is not None:
+        primary_payload["hwidDeviceLimit"] = hwid_device_limit
+        fallback_payload["hwid_device_limit"] = hwid_device_limit
+
+    def validate_external_squad(request_payload, response_user):
+        if not isinstance(response_user, dict):
+            return True
+        expected = request_payload.get("externalSquadUuid")
+        if "external_squad_uuid" in request_payload:
+            expected = request_payload.get("external_squad_uuid")
+        actual = response_user.get("externalSquadUuid")
+        if actual is None and "external_squad_uuid" in response_user:
+            actual = response_user.get("external_squad_uuid")
+        return (actual or None) == (expected or None)
+
+    payload_variants = (
+        primary_payload,
+        fallback_payload,
+    )
+    return patch_user(user_uuid, payload_variants, response_validator=validate_external_squad)
 
 
 def patch_user_access(user_uuid, expire_at, traffic_limit_bytes=None, traffic_limit_strategy=""):
@@ -805,9 +870,11 @@ class WebhookHandler(BaseHTTPRequestHandler):
         username = user.get("username") or user.get("email") or user_uuid
         status = infer_status(event, user)
         squad_uuids = extract_squad_uuids(user)
+        external_squad_uuid = extract_external_squad_uuid(user)
         expire_at = extract_expire_at(user)
         subscription_profile = extract_subscription_profile(user)
         used_traffic_bytes = extract_used_traffic_bytes(user)
+        hwid_device_limit = parse_int_value(subscription_profile.get("hwid_device_limit"))
 
         if event and event not in SUPPORTED_USER_EVENTS:
             log(f"Ignoring unsupported user event={event} for {username}")
@@ -817,7 +884,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
         log(
             f"Webhook received: event={event or 'unknown'}, "
             f"user={username}, status={status or 'unknown'}, "
-            f"squads={squad_uuids}, expireAt={format_datetime_value(expire_at) if expire_at else 'unknown'}, "
+            f"squads={squad_uuids}, externalSquad={external_squad_uuid or 'none'}, "
+            f"expireAt={format_datetime_value(expire_at) if expire_at else 'unknown'}, "
             f"subscriptionProfile={preview_json(subscription_profile)}"
         )
 
@@ -828,8 +896,12 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
         if should_handle_backup:
             target_squads = list(BACKUP_SQUAD_UUIDS)
+            target_external_squad_uuid = get_backup_external_squad_uuid()
             user_state = user_states.get(user_uuid)
-            already_on_backup = squads_match(squad_uuids, target_squads)
+            already_on_backup = (
+                squads_match(squad_uuids, target_squads)
+                and external_squads_match(external_squad_uuid, target_external_squad_uuid)
+            )
 
             if not squad_uuids:
                 log(f"User {username} has no squads in payload, skipping backup")
@@ -845,7 +917,13 @@ class WebhookHandler(BaseHTTPRequestHandler):
                     self._send_text(200, "Ignored")
                     return
 
-                user_state = build_user_state(squad_uuids, status=status, expire_at=expire_at)
+                user_state = build_user_state(
+                    squad_uuids,
+                    status=status,
+                    expire_at=expire_at,
+                    original_external_squad_uuid=external_squad_uuid,
+                    original_external_squad_known=True,
+                )
                 if subscription_profile:
                     user_state["original_subscription_profile"] = dict(subscription_profile)
                 user_states[user_uuid] = user_state
@@ -860,6 +938,10 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
                 if not user_state.get("original_squads") and not already_on_backup:
                     user_state["original_squads"] = list(normalize_squad_uuids(squad_uuids))
+                    state_changed = True
+
+                if "original_external_squad_uuid" not in user_state and not already_on_backup:
+                    user_state["original_external_squad_uuid"] = external_squad_uuid
                     state_changed = True
 
                 if status and not user_state.get("original_status"):
@@ -934,18 +1016,42 @@ class WebhookHandler(BaseHTTPRequestHandler):
                         f"{user_state['temporary_active_until']}, leaving current state"
                     )
 
-            if already_on_backup:
+            internal_squads_already_on_backup = squads_match(squad_uuids, target_squads)
+            external_squad_already_on_backup = external_squads_match(
+                external_squad_uuid,
+                target_external_squad_uuid,
+            )
+
+            if internal_squads_already_on_backup:
                 log(
-                    f"User {username} already has target squads {target_squads}, "
-                    f"skipping squad patch"
+                    f"User {username} already has target internal squads {target_squads}, "
+                    f"skipping internal squad patch"
                 )
             elif not patch_user_squad(user_uuid, target_squads):
                 log(
-                    f"Failed to switch {username} to backup squads {target_squads}; "
+                    f"Failed to switch {username} to backup internal squads {target_squads}; "
                     f"acknowledging webhook to avoid retry loop"
                 )
-                self._send_text(200, "Failed to patch user")
+                self._send_text(200, "Failed to patch user internal squads")
                 return
+
+            if target_external_squad_uuid:
+                if external_squad_already_on_backup:
+                    log(
+                        f"User {username} already has target external squad "
+                        f"{target_external_squad_uuid}, skipping external squad patch"
+                    )
+                elif not patch_user_external_squad(
+                    user_uuid,
+                    target_external_squad_uuid,
+                    hwid_device_limit=hwid_device_limit,
+                ):
+                    log(
+                        f"Failed to switch {username} to external squad "
+                        f"{target_external_squad_uuid}; acknowledging webhook to avoid retry loop"
+                    )
+                    self._send_text(200, "Failed to patch user external squad")
+                    return
 
         else:
             user_state = user_states.get(user_uuid)
@@ -969,6 +1075,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 log(f"No saved squads for {username}, nothing to restore")
             else:
                 squads_to_restore = user_state.get("original_squads") or []
+                external_squad_to_restore = user_state.get("original_external_squad_uuid") if "original_external_squad_uuid" in user_state else None
+                should_restore_external_squad = "original_external_squad_uuid" in user_state
                 if not squads_to_restore:
                     log(f"Saved state for {username} has no original squads, nothing to restore")
                     self._send_text(200, "Ignored")
@@ -991,33 +1099,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
                     subscription_profile,
                 )
 
-                if squads_match(squad_uuids, squads_to_restore):
-                    if restore_access_settings and not patch_user_traffic_settings(
-                        user_uuid,
-                        traffic_limit_bytes=restore_access_settings.get("traffic_limit_bytes"),
-                        traffic_limit_strategy=restore_access_settings.get(
-                            "traffic_limit_strategy", ""
-                        ),
-                    ):
-                        log(
-                            f"Failed to restore original access settings for {username}: "
-                            f"{preview_json(restore_access_settings)}; "
-                            f"acknowledging webhook to retry on the next user event"
-                        )
-                        self._send_text(200, "Failed to restore user access settings")
-                        return
-
-                    user_states.pop(user_uuid, None)
-                    if not save_user_states():
-                        user_states[user_uuid] = user_state
-                        self._send_text(500, "Failed to update local state")
-                        return
-
-                    log(
-                        f"Original squads already restored for {username}: "
-                        f"{squads_to_restore}"
-                    )
-                else:
+                if not squads_match(squad_uuids, squads_to_restore):
                     if not patch_user_squad(user_uuid, squads_to_restore):
                         log(
                             f"Failed to restore original squads for {username}: "
@@ -1025,29 +1107,58 @@ class WebhookHandler(BaseHTTPRequestHandler):
                         )
                         self._send_text(200, "Failed to restore user squads")
                         return
+                else:
+                    log(
+                        f"Original internal squads already restored for {username}: "
+                        f"{squads_to_restore}"
+                    )
 
-                    if restore_access_settings and not patch_user_traffic_settings(
-                        user_uuid,
-                        traffic_limit_bytes=restore_access_settings.get("traffic_limit_bytes"),
-                        traffic_limit_strategy=restore_access_settings.get(
-                            "traffic_limit_strategy", ""
-                        ),
-                    ):
+                if should_restore_external_squad:
+                    if not external_squads_match(external_squad_uuid, external_squad_to_restore):
+                        if not patch_user_external_squad(
+                            user_uuid,
+                            external_squad_to_restore,
+                            hwid_device_limit=hwid_device_limit,
+                        ):
+                            log(
+                                f"Failed to restore original external squad for {username}: "
+                                f"{external_squad_to_restore or 'none'}; "
+                                f"acknowledging webhook to avoid retry loop"
+                            )
+                            self._send_text(200, "Failed to restore user external squad")
+                            return
+                    else:
                         log(
-                            f"Failed to restore original access settings for {username}: "
-                            f"{preview_json(restore_access_settings)}; "
-                            f"acknowledging webhook to retry on the next user event"
+                            f"Original external squad already restored for {username}: "
+                            f"{external_squad_to_restore or 'none'}"
                         )
-                        self._send_text(200, "Failed to restore user access settings")
-                        return
 
-                    user_states.pop(user_uuid, None)
-                    if not save_user_states():
-                        user_states[user_uuid] = user_state
-                        self._send_text(500, "Failed to update local state")
-                        return
+                if restore_access_settings and not patch_user_traffic_settings(
+                    user_uuid,
+                    traffic_limit_bytes=restore_access_settings.get("traffic_limit_bytes"),
+                    traffic_limit_strategy=restore_access_settings.get(
+                        "traffic_limit_strategy", ""
+                    ),
+                ):
+                    log(
+                        f"Failed to restore original access settings for {username}: "
+                        f"{preview_json(restore_access_settings)}; "
+                        f"acknowledging webhook to retry on the next user event"
+                    )
+                    self._send_text(200, "Failed to restore user access settings")
+                    return
 
-                    log(f"Restored original squads for {username}: {squads_to_restore}")
+                user_states.pop(user_uuid, None)
+                if not save_user_states():
+                    user_states[user_uuid] = user_state
+                    self._send_text(500, "Failed to update local state")
+                    return
+
+                log(
+                    f"Restored original squads for {username}: "
+                    f"internal={squads_to_restore}, "
+                    f"external={external_squad_to_restore or 'none'}"
+                )
 
         self._send_text(200, "OK")
 
@@ -1056,7 +1167,9 @@ def run():
     server = HTTPServer(("0.0.0.0", PORT), WebhookHandler)
     log(
         f"Webhook server running on port {PORT}, path {normalize_path(WEBHOOK_PATH)}, "
-        f"api_url={API_URL}, temp_active_days={TEMP_ACTIVE_DAYS}, "
+        f"api_url={API_URL}, backup_squad_uuids={BACKUP_SQUAD_UUIDS}, "
+        f"external_squad_uuids={EXTERNAL_SQUAD_UUIDS or 'none'}, "
+        f"temp_active_days={TEMP_ACTIVE_DAYS}, "
         f"temp_active_traffic_limit_mb={TEMP_ACTIVE_TRAFFIC_LIMIT_MB}"
     )
     server.serve_forever()
