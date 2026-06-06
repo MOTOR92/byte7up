@@ -36,7 +36,7 @@ SUPPORTED_USER_EVENTS = set(EVENTS_TO_BACKUP) | set(EVENTS_TO_RESTORE) | {
 PORT = int(os.getenv("PORT", "3000"))
 API_URL = os.getenv("RW_API_URL", "https://panel.example.com/api").rstrip("/")
 API_TOKEN = os.getenv("RW_API_TOKEN", "YOUR_API_TOKEN")
-BACKUP_SQUAD_UUID = os.getenv("BACKUP_SQUAD_UUID", "backup-squad-uuid")
+BACKUP_SQUAD_UUIDS = [     s.strip()     for s in os.getenv("BACKUP_SQUAD_UUID", "backup-squad-uuid").split(",")     if s.strip() ]
 TEMP_ACTIVE_DAYS = getenv_int("TEMP_ACTIVE_DAYS", 3)
 TEMP_ACTIVE_TRAFFIC_LIMIT_MB = max(0, getenv_int("TEMP_ACTIVE_TRAFFIC_LIMIT_MB", 300))
 TEMP_ACTIVE_TRAFFIC_LIMIT_BYTES = (
@@ -809,7 +809,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
         )
 
         if should_handle_backup:
-            target_squads = [BACKUP_SQUAD_UUID]
+            target_squads = list(BACKUP_SQUAD_UUIDS)
             user_state = user_states.get(user_uuid)
             already_on_backup = squads_match(squad_uuids, target_squads)
 
