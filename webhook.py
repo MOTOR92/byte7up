@@ -41,15 +41,7 @@ BACKUP_SQUAD_UUIDS = [
     for s in os.getenv("BACKUP_SQUAD_UUID", "backup-squad-uuid").split(",")
     if s.strip()
 ]
-EXTERNAL_SQUAD_UUIDS = [
-    s.strip()
-    for s in (
-        os.getenv("EXTERNAL_SQUAD_UUIDS")
-        or os.getenv("EXTERNAL_SQUAD_UUID")
-        or ""
-    ).split(",")
-    if s.strip()
-]
+EXTERNAL_SQUAD_UUID = (os.getenv("EXTERNAL_SQUAD_UUID") or "").strip() or None
 TEMP_ACTIVE_DAYS = getenv_int("TEMP_ACTIVE_DAYS", 3)
 TEMP_ACTIVE_TRAFFIC_LIMIT_MB = max(0, getenv_int("TEMP_ACTIVE_TRAFFIC_LIMIT_MB", 300))
 TEMP_ACTIVE_TRAFFIC_LIMIT_BYTES = (
@@ -295,7 +287,7 @@ def external_squads_match(current_external_squad_uuid, target_external_squad_uui
 
 
 def get_backup_external_squad_uuid():
-    return EXTERNAL_SQUAD_UUIDS[0] if EXTERNAL_SQUAD_UUIDS else None
+    return EXTERNAL_SQUAD_UUID
 
 
 def extract_expire_at(user):
@@ -586,9 +578,8 @@ def patch_user(user_uuid, payload_variants, response_validator=None):
                 headers={
                     "Authorization": f"Bearer {API_TOKEN}",
                     "Content-Type": "application/json",
-                        "X-Forwarded-Proto": "https",
-                        "X-Forwarded-For": "127.0.0.1",
-                        "X-Forwarded-Proto": "https",
+                    "X-Forwarded-Proto": "https",
+                    "X-Forwarded-For": "127.0.0.1",
                 },
             )
 
@@ -1168,7 +1159,7 @@ def run():
     log(
         f"Webhook server running on port {PORT}, path {normalize_path(WEBHOOK_PATH)}, "
         f"api_url={API_URL}, backup_squad_uuids={BACKUP_SQUAD_UUIDS}, "
-        f"external_squad_uuids={EXTERNAL_SQUAD_UUIDS or 'none'}, "
+        f"external_squad_uuid={EXTERNAL_SQUAD_UUID or 'none'}, "
         f"temp_active_days={TEMP_ACTIVE_DAYS}, "
         f"temp_active_traffic_limit_mb={TEMP_ACTIVE_TRAFFIC_LIMIT_MB}"
     )
