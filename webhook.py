@@ -37,6 +37,7 @@ PORT = int(os.getenv("PORT", "3000"))
 API_URL = os.getenv("RW_API_URL", "https://panel.example.com/api").rstrip("/")
 API_TOKEN = os.getenv("RW_API_TOKEN", "YOUR_API_TOKEN")
 BACKUP_SQUAD_UUIDS = [     s.strip()     for s in os.getenv("BACKUP_SQUAD_UUID", "backup-squad-uuid").split(",")     if s.strip() ]
+EXTERNAL_SQUAD_UUIDS = [     s.strip()     for s in os.getenv("EXTERNAL_SQUAD_UUIDS", "").split(",")     if s.strip() ]
 TEMP_ACTIVE_DAYS = getenv_int("TEMP_ACTIVE_DAYS", 3)
 TEMP_ACTIVE_TRAFFIC_LIMIT_MB = max(0, getenv_int("TEMP_ACTIVE_TRAFFIC_LIMIT_MB", 300))
 TEMP_ACTIVE_TRAFFIC_LIMIT_BYTES = (
@@ -571,10 +572,27 @@ def patch_user(user_uuid, payload_variants, response_validator=None):
     return False
 
 
+def is_external_squad(squad_uuid):
+    return squad_uuid in EXTERNAL_SQUAD_UUIDS
+
+
 def patch_user_squad(user_uuid, squads):
-    payload_variants = (
-        {"activeInternalSquads": squads},
-    )
+    if not squads:
+        return True
+
+    first_squad = squads[0] if isinstance(squads, list) else squads
+
+    if is_external_squad(first_squad):
+        payload_variants = (
+            {"externalSquadUuid": first_squad},
+            {"external_squad_uuid": first_squad},
+        )
+    else:
+        payload_variants = (
+            {"activeInternalSquads": squads},
+            {"active_internal_squads": squads},
+        )
+
     return patch_user(user_uuid, payload_variants)
 
 
